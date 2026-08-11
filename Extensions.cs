@@ -35,5 +35,18 @@ namespace YellowMacaroni.Redis.Queue
         {
             return DateTimeOffset.FromUnixTimeMilliseconds(GetUnixTimestampMs(entry));
         }
+
+        public static async Task<TimeSpan> GetDurationSinceEnqueueAsync(this StreamEntry entry, RedisQueue queue)
+        {
+            var timestamp = GetTimestamp(entry);
+            var now = await queue.GetServerTimeOffsetAsync();
+            return now - timestamp;
+        }
+
+        public static async Task<long> GetMillisecondsSinceEnqueueAsync(this StreamEntry entry, RedisQueue queue)
+        {
+            var duration = await GetDurationSinceEnqueueAsync(entry, queue);
+            return (long)duration.TotalMilliseconds;
+        }
     }
 }

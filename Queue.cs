@@ -3,6 +3,7 @@ using StackExchange.Redis;
 using System;
 using System.Collections.Generic;
 using System.Text;
+using ScriptResources = YellowMacaroni.Redis.Queue.Scripts.Load;
 
 #pragma warning disable CS0618
 namespace YellowMacaroni.Redis.Queue
@@ -17,7 +18,7 @@ namespace YellowMacaroni.Redis.Queue
         public readonly string groupName;
         public readonly string name;
 
-        private readonly QueueOptions? options;
+        private readonly QueueOptions? _options;
 
         public RedisQueue(QueueClient client, string name, QueueOptions? options = null)
         {
@@ -26,7 +27,7 @@ namespace YellowMacaroni.Redis.Queue
             this.machineId = options?.MachineId ?? Guid.NewGuid().ToString();
             this.groupName = options?.GroupName ?? name;
             this.name = name;
-            this.options = options;
+            this._options = options;
 
             try
             {
@@ -42,15 +43,14 @@ namespace YellowMacaroni.Redis.Queue
         /// <returns></returns>
         public async Task<RedisValue> Enqueue(T data)
         {
-            var result = await _database.StreamAddAsync(name,
+            var result = await StreamAddAsync(name,
             [
                 new NameValueEntry("id", Guid.NewGuid().ToString()),
                 new NameValueEntry("data", JsonConvert.SerializeObject(data)),
-                new NameValueEntry("attempt", "1"),
-                new NameValueEntry("timestamp", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString())
+                new NameValueEntry("attempt", "1")
             ]);
 
-            if (options?.PublishEvents ?? true)
+            if (_options?.PublishEvents ?? true)
             {
                 Task _ = _subscriber.PublishAsync($"yellowmacaroni.redis.queue-{name}", "new_message");
             }
@@ -60,50 +60,41 @@ namespace YellowMacaroni.Redis.Queue
 
         public async Task Enqueue(T data, TimeSpan runIn)
         {
-            long readyAt = DateTimeOffset.UtcNow.Add(runIn).ToUnixTimeMilliseconds();
-
             var payload = new
             {
                 id = Guid.NewGuid().ToString(),
-                data,
-                attempt = "1",
-                timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString()
+                data = JsonConvert.SerializeObject(data),
+                attempt = "1"
             };
 
-            await _database.SortedSetAddAsync(
-                $"queue:{name}:delayed", 
-                JsonConvert.SerializeObject(payload),
-                readyAt
-            );
+            await AddDelayedAsync(JsonConvert.SerializeObject(payload), runIn);
         }
 
         public async Task Requeue(StreamEntry entry)
         {
-            if (entry.GetAttempt() >= (options?.MaxRetries ?? 3))
+            if (entry.GetAttempt() >= (_options?.MaxRetries ?? 3))
             {
                 await AcknowledgeEntry(entry);
                 return;
             }
 
-            await _database.StreamAddAsync(name,
+            await StreamAddAsync(name,
             [
                 new NameValueEntry("id", entry.GetId()),
                 new NameValueEntry("data", entry.GetData()),
-                new NameValueEntry("attempt", (entry.GetAttempt() + 1).ToString()),
-                new NameValueEntry("timestamp", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString())
+                new NameValueEntry("attempt", (entry.GetAttempt() + 1).ToString())
             ]);
             await AcknowledgeEntry(entry);
         }
 
         public async Task Requeue(StreamEntry entry, TimeSpan runIn)
         {
-            if (entry.GetAttempt() >= (options?.MaxRetries ?? 3))
+            if (entry.GetAttempt() >= (_options?.MaxRetries ?? 3))
             {
                 await AcknowledgeEntry(entry);
                 return;
             }
 
-            long readyAt = DateTimeOffset.UtcNow.Add(runIn).ToUnixTimeMilliseconds();
             var payload = new
             {
                 id = entry.GetId(),
@@ -111,33 +102,15 @@ namespace YellowMacaroni.Redis.Queue
                 attempt = (entry.GetAttempt() + 1).ToString(),
                 timestamp = entry.GetUnixTimestampMs().ToString()
             };
-            await _database.SortedSetAddAsync(
-                $"queue:{name}:delayed",
-                JsonConvert.SerializeObject(payload),
-                readyAt
-            );
+            await AddDelayedAsync(JsonConvert.SerializeObject(payload), runIn);
             await AcknowledgeEntry(entry);
         }
-
-        private const string _promoteScript = @"
-            local due = redis.call('ZRANGEBYSCORE', KEYS[1], 0, ARGV[1])
-            for _, member in ipairs(due) do
-                redis.call('ZREM', KEYS[1], member)
-                local job = cjson.decode(member)
-                redis.call('XADD', KEYS[2], '*',
-                    'id', job.id,
-                    'data', job.data,
-                    'attempt', job.attempt,
-                    'timestamp', job.timestamp)
-            end
-            return #due";
 
         public async Task<int> RequeueDelayedJobs()
         {
             var result = await _database.ScriptEvaluateAsync(
-                _promoteScript,
-                [$"queue:{name}:delayed", name],
-                [DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()]
+                ScriptResources.PromoteDelayed,
+                [$"queue:{name}:delayed", name]
             );
 
             return (int)result;
@@ -168,16 +141,15 @@ namespace YellowMacaroni.Redis.Queue
                     semaphore.Release();
                 });
 
-                await _database.StreamAddAsync(name,
+                await StreamAddAsync(name,
                 [
                     new NameValueEntry("id", id),
                     new NameValueEntry("data", JsonConvert.SerializeObject(data)),
-                    new NameValueEntry("attempt", "1"),
-                    new NameValueEntry("timestamp", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString())
+                    new NameValueEntry("attempt", "1")
                 ]);
 
                 // Wait for the response or timeout
-                await semaphore.WaitAsync(TimeSpan.FromMilliseconds(options?.ReturnMaxWaitMs ?? 30_000), cts.Token).ContinueWith(_ => { });
+                await semaphore.WaitAsync(TimeSpan.FromMilliseconds(_options?.ReturnMaxWaitMs ?? 30_000), cts.Token).ContinueWith(_ => { });
 
                 return returnData;
             }
@@ -187,6 +159,34 @@ namespace YellowMacaroni.Redis.Queue
             }
         }
 
+        private async Task<RedisValue> StreamAddAsync(RedisKey key, NameValueEntry[] values)
+        {
+            var arguments = new RedisValue[values.Length * 2];
+
+            for (var index = 0; index < values.Length; index++)
+            {
+                arguments[index * 2] = values[index].Name;
+                arguments[(index * 2) + 1] = values[index].Value;
+            }
+
+            var result = await _database.ScriptEvaluateAsync(
+                ScriptResources.StreamAdd,
+                [key],
+                arguments
+            );
+
+            return (RedisValue)result;
+        }
+
+        private Task<RedisResult> AddDelayedAsync(string payload, TimeSpan runIn)
+        {
+            return _database.ScriptEvaluateAsync(
+                ScriptResources.AddDelayed,
+                [$"queue:{name}:delayed"],
+                [(long)runIn.TotalMilliseconds, payload]
+            );
+        }
+
         public async Task<StreamEntry[]> Dequeue(int count)
         {
             var result = await _database.StreamReadGroupAsync(
@@ -194,7 +194,7 @@ namespace YellowMacaroni.Redis.Queue
                 groupName,
                 consumerName: machineId,
                 count: count,
-                position: options?.GetQueuePositionString() ?? ">"
+                position: _options?.GetQueuePositionString() ?? ">"
             );
 
             return result;
@@ -239,11 +239,11 @@ namespace YellowMacaroni.Redis.Queue
 
             while (!ct?.IsCancellationRequested ?? true)
             {
-                await semaphore.WaitAsync(TimeSpan.FromMilliseconds(options?.PollWaitMs ?? 1000), ct ?? CancellationToken.None).ContinueWith(_ => { });
+                await semaphore.WaitAsync(TimeSpan.FromMilliseconds(_options?.PollWaitMs ?? 1000), ct ?? CancellationToken.None).ContinueWith(_ => { });
 
                 while (true)
                 {
-                    var entries = await Dequeue(options?.DequeueCount ?? 10);
+                    var entries = await Dequeue(_options?.DequeueCount ?? 10);
 
                     if (entries.Length == 0) break;
 
@@ -285,7 +285,7 @@ namespace YellowMacaroni.Redis.Queue
                     }
                     else
                     {
-                        await Requeue(entry, TimeSpan.FromMilliseconds(options?.GetBackoff(entry.GetAttempt()) ?? 1000));
+                        await Requeue(entry, TimeSpan.FromMilliseconds(_options?.GetBackoff(entry.GetAttempt()) ?? 1000));
                     }
                 }
                 else
@@ -326,6 +326,17 @@ namespace YellowMacaroni.Redis.Queue
         public Task<StreamAutoClaimResult> ReclaimCrashed(long minIdleTimeMs = 0, int? count = null)
         {
             return _database.StreamAutoClaimAsync(name, groupName, machineId, minIdleTimeMs, "0-0", count);
+        }
+
+        public async Task<(long seconds, long microseconds)> GetServerTimeAsync()
+        {
+            var result = await _database.ExecuteAsync("TIME");
+            return ((long)result[0], (long)result[1]);
+        }
+        public async Task<DateTimeOffset> GetServerTimeOffsetAsync()
+        {
+            var (seconds, microseconds) = await GetServerTimeAsync();
+            return DateTimeOffset.FromUnixTimeSeconds(seconds).AddMicroseconds(microseconds);
         }
     }
 }

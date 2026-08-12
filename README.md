@@ -1,4 +1,10 @@
 ## YellowMacaroni.Redis.Queue
+[![CI/CD](https://github.com/YellowMacaroni/YellowMacaroni.Redis.Queue/actions/workflows/ci.yml/badge.svg)](https://github.com/YellowMacaroni/YellowMacaroni.Redis.Queue/actions/workflows/ci.yml)
+[![GitHub latest commit](https://badgen.net/github/last-commit/YellowMacaroni/YellowMacaroni.Redis.Queue)](https://GitHub.com/YellowMacaroni/YellowMacaroni.Redis.Queue/commit/)
+[![NuGet stable version](https://badgen.net/nuget/v/yellowmacaroni.redis.queue)](https://nuget.org/packages/yellowmacaroni.redis.queue)
+[![NuGet pre version](https://badgen.net/nuget/v/yellowmacaroni.redis.queue/pre)](https://nuget.org/packages/yellowmacaroni.redis.queue)
+[![GitHub license](https://badgen.net/github/license/Naereen/Strapdown.js)](https://github.com/Naereen/StrapDown.js/blob/master/LICENSE)
+
 A .NET package that provides a simple way to work with Redis queues.
 
 ### How to use
